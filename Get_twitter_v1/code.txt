@@ -1,0 +1,683 @@
+我的源代码现在有一个小问题，一是创建时间的时差问题，应该把API推送的时间转换为北京时间，二是互动数据等应该保存在数据库中的内容全部都为0或者null，但是从终端输出的结果来看，前端输出拿到了正确的数据，请结合这个情况对有问题的源码部分进行完善：ai_summarizer.py：
+
+import os
+import json
+from openai import OpenAI
+from dotenv import load_dotenv
+
+
+class AISummarizer:
+    def __init__(self):
+        # 加载环境变量
+        load_dotenv()
+
+        # 获取阿里云百炼API密钥
+        self.api_key = os.getenv('DASHSCOPE_API_KEY')
+        if not self.api_key:
+            raise ValueError("请在.env文件中配置DASHSCOPE_API_KEY")
+
+        # 初始化阿里云百炼客户端
+        self.client = OpenAI(
+            api_key=self.api_key,
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",  # 北京地域
+        )
+
+        # 设置模型
+        self.model = "qwen-plus"  # 可根据需要改为 qwen-max 或 qwen-flash
+
+    def generate_summary(self, formatted_tweet):
+        """
+        使用阿里云百炼大模型生成推文摘要
+
+        Args:
+            formatted_tweet: 格式化后的推文数据
+
+        Returns:
+            str: 生成的摘要文本
+        """
+        try:
+            # 构建推文内容
+            tweet_content = formatted_tweet.get('text', '')
+            username = formatted_tweet.get('username', '')
+            metrics = formatted_tweet.get('public_metrics', {})
+
+            # 构建提示词
+            prompt = f"""
+请对以下推文内容进行摘要分析：
+
+发布者: @{username}
+推文内容: {tweet_content}
+互动数据: 点赞{metrics.get('like_count', 0)} | 转推{metrics.get('retweet_count', 0)} | 回复{metrics.get('reply_count', 0)}
+
+请从以下角度生成一个简洁的摘要：
+1. 主要内容概括
+2. 情感倾向分析
+3. 可能的话题标签建议
+4. 相关话题热度情况
+
+要求：回复内容为纯文本，不超过150字。
+"""
+
+            # 调用阿里云百炼API
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "你是一个专业的社交媒体内容分析师，擅长用简洁的语言概括推文内容。"},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,  # 较低的温度值以获得更稳定的输出
+                max_tokens=300  # 限制输出长度
+            )
+
+            # 提取生成的摘要
+            summary = response.choices[0].message.content.strip()
+            return summary
+
+        except Exception as e:
+            print(f"AI摘要生成失败: {e}")
+            return f"摘要生成失败: {str(e)}"
+
+    def batch_summarize(self, tweets_list):
+        """
+        批量生成推文摘要 (保留此方法用于兼容性)
+
+        Args:
+            tweets_list: 推文数据列表
+
+        Returns:
+            list: 包含摘要的推文列表
+        """
+        summarized_tweets = []
+
+        for tweet in tweets_list:
+            print(f"正在为 @{tweet.get('username', '')} 的推文生成AI摘要...")
+
+            # 生成摘要
+            summary = self.generate_summary(tweet)
+
+            # 将摘要添加到推文数据中
+            tweet_with_summary = tweet.copy()
+            tweet_with_summary['ai_summary'] = summary
+
+            summarized_tweets.append(tweet_with_summary)
+
+            # 添加延迟避免API限制
+            import time
+            time.sleep(1)
+
+        return summarized_tweets
+
+
+App.py:
+
+
+import os
+import requests
+import time
+import signal
+import sys
+from datetime import datetime
+from dotenv import load_dotenv
+
+from database import TweetDatabase
+from ai_summarizer import AISummarizer
+from dingtalk_bot import dingtalk_bot
+
+
+class TwitterAPIIOMonitor:
+    def __init__(self):
+        # 加载环境变量
+        load_dotenv()
+
+        self.api_key = os.getenv("TWITTER_API_KEY")
+        if not self.api_key:
+            raise ValueError("请在.env配置TWITTER_API_KEY")
+
+        self.base_url = "https://api.twitterapi.io"
+        self.headers = {
+            "X-API-Key": self.api_key,
+            "Content-Type": "application/json"
+        }
+
+        # 🔧 从环境变量读取多个博主
+        target_users_str = os.getenv("TARGET_USERS", "whyyoutouzhele")
+        self.target_users = [user.strip() for user in target_users_str.split(",") if user.strip()]
+
+        # 🔧 从环境变量读取监控配置
+        self.monitor_interval = int(os.getenv("MONITOR_INTERVAL", "300"))  # 默认5分钟
+        # 🔧 修改：默认只获取5条最新推文，节省token
+        self.max_tweets_per_request = int(os.getenv("MAX_TWEETS_PER_REQUEST", "5"))
+
+        # 控制程序运行的标志
+        self.running = True
+
+        # 设置信号处理，支持优雅退出
+        signal.signal(signal.SIGINT, self.signal_handler)
+        signal.signal(signal.SIGTERM, self.signal_handler)
+
+        self.db = TweetDatabase()  # 初始化数据库模块
+        self.ai_summarizer = AISummarizer()  # 初始化AI摘要模块
+
+        print(f"🎯 监控目标: {', '.join(['@' + user for user in self.target_users])}")
+        print(f"⏰ 监控间隔: {self.monitor_interval} 秒")
+        print(f"📊 每次获取: {self.max_tweets_per_request} 条推文 (节省token模式)")
+        print(f"💰 预计每周期消耗: {len(self.target_users) * 1} 次API调用")
+
+    def signal_handler(self, signum, frame):
+        """处理退出信号"""
+        print(f"\n🛑 收到退出信号，正在停止监控...")
+        self.running = False
+
+    def get_latest_tweets(self, username, limit=None):
+        """获取用户最新推文"""
+        if limit is None:
+            limit = self.max_tweets_per_request
+
+        endpoint = f"{self.base_url}/twitter/tweet/advanced_search"
+
+        params = {
+            "query": f"from:{username}",
+            "queryType": "Latest",
+            "limit": limit
+        }
+
+        try:
+            print(f"📡 正在获取 @{username} 的最新 {limit} 条推文...")
+            resp = requests.get(endpoint, headers=self.headers, params=params, timeout=30)
+
+            if resp.status_code != 200:
+                print(f"❌ 请求失败: {resp.status_code} - {resp.text}")
+                return []
+
+            data = resp.json()
+            tweets = data.get("tweets", []) or data.get("data", [])
+
+            print(f"✅ 成功获取 @{username} 的 {len(tweets)} 条推文")
+            return tweets
+
+        except Exception as e:
+            print(f"❌ 获取 @{username} 最新推文失败: {e}")
+            return []
+
+    def format_tweet(self, tweet, username):
+        """标准化推文"""
+        tweet_id = tweet.get("id")
+        text = tweet.get("text", "")
+
+        # 时间处理
+        created_at_raw = tweet.get('createdAt')
+        created_at = created_at_raw
+
+        if created_at_raw:
+            try:
+                # 解析格式：'Sat Nov 22 04:00:00 +0000 2025'
+                dt = datetime.strptime(created_at_raw, '%a %b %d %H:%M:%S %z %Y')
+                created_at = dt.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception as e:
+                try:
+                    # 尝试ISO格式
+                    dt = datetime.fromisoformat(created_at_raw.replace('Z', '+00:00'))
+                    created_at = dt.strftime("%Y-%m-%d %H:%M:%S")
+                except:
+                    pass
+
+        # 互动数据
+        likes = tweet.get('likeCount', 0) or tweet.get('favorite_count', 0)
+        retweets = tweet.get('retweetCount', 0)
+        replies = tweet.get('replyCount', 0)
+        quotes = tweet.get('quoteCount', 0)
+        views = tweet.get('viewCount', 0)
+
+        return {
+            "username": username,
+            "tweet_id": tweet_id,
+            "text": text,
+            "created_at": created_at,
+            "raw_created_at": created_at_raw,
+            "likes": likes,
+            "retweets": retweets,
+            "replies": replies,
+            "quotes": quotes,
+            "views": views,
+            "entities": tweet.get("entities", {}),
+            "attachments": tweet.get("attachments", {}),
+            "geo": tweet.get("geo", {}),
+            "source": tweet.get("source"),
+            "lang": tweet.get("lang"),
+            "possibly_sensitive": tweet.get("possibly_sensitive", False),
+            "public_metrics": {
+                'like_count': likes,
+                'retweet_count': retweets,
+                'reply_count': replies,
+                'quote_count': quotes,
+                'view_count': views
+            },
+            "raw_tweet": tweet
+        }
+
+    def process_single_tweet(self, tweet_data):
+        """处理单条推文 - 生成AI摘要并立即推送"""
+        print("\n" + "=" * 60)
+        print("🔥 捕获到新推文！")
+        print(f"👤 用户: @{tweet_data['username']}")
+        print(f"🕐 时间: {tweet_data['created_at']}")
+        print(f"📝 内容: {tweet_data['text'][:100]}{'...' if len(tweet_data['text']) > 100 else ''}")
+        print(
+            f"📊 互动: 👍 {tweet_data['likes']} | 🔄 {tweet_data['retweets']} | 💬 {tweet_data['replies']} | 👁️ {tweet_data['views']}")
+
+        # 立即生成AI摘要
+        print("🤖 正在生成AI摘要...")
+        ai_summary = self.ai_summarizer.generate_summary(tweet_data)
+        tweet_data['ai_summary'] = ai_summary
+
+        print("🤖 AI摘要:")
+        print(f"   {ai_summary}")
+        print("=" * 60)
+
+        # 写入数据库
+        self.db.insert_tweet(tweet_data)
+
+        # 立即发送钉钉通知
+        print("📤 正在发送钉钉通知...")
+        success = dingtalk_bot.send_tweet_notification(tweet_data)
+        if success:
+            print("✅ 钉钉通知发送成功")
+        else:
+            print("❌ 钉钉通知发送失败")
+
+        # 添加延迟避免频繁请求
+        time.sleep(2)
+
+        return True
+
+    def process_new_tweets(self, formatted_tweets):
+        """处理新推文 - 逐条处理并立即推送"""
+        if not formatted_tweets:
+            return 0
+
+        print(f"🤖 发现 {len(formatted_tweets)} 条新推文，开始逐条处理...")
+
+        processed_count = 0
+        for tweet in formatted_tweets:
+            if not self.running:
+                break
+
+            try:
+                self.process_single_tweet(tweet)
+                processed_count += 1
+            except Exception as e:
+                print(f"❌ 处理推文失败: {e}")
+                # 继续处理下一条推文
+                continue
+
+        return processed_count
+
+    def monitor_single_cycle(self):
+        """执行单次监控循环"""
+        print(f"\n🔄 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 开始监控循环...")
+
+        all_new_tweets = []
+        total_checked = 0
+
+        for username in self.target_users:
+            if not self.running:
+                break
+
+            print(f"🔍 正在检查 @{username} ...")
+            tweets = self.get_latest_tweets(username)
+            total_checked += len(tweets)
+
+            new_tweets = []
+            for tweet in tweets:
+                if not self.running:
+                    break
+
+                tweet_id = tweet.get("id")
+                if tweet_id and not self.db.tweet_exists(tweet_id):
+                    formatted = self.format_tweet(tweet, username)
+                    new_tweets.append(formatted)
+
+            if new_tweets:
+                print(f"✅ @{username}: 发现 {len(new_tweets)} 条新推文")
+                all_new_tweets.extend(new_tweets)
+            else:
+                print(f"ℹ️  @{username}: 没有新推文")
+
+        # 处理所有新推文
+        if all_new_tweets:
+            processed_count = self.process_new_tweets(all_new_tweets)
+            print(f"🎉 本轮监控完成: 成功处理 {processed_count}/{len(all_new_tweets)} 条新推文")
+        else:
+            print(f"📭 本轮监控完成: 没有发现新推文 (检查了 {total_checked} 条推文)")
+
+    def start_real_time_monitoring(self):
+        """启动实时监控"""
+        print("🚀 启动 Twitter 实时监控...")
+        print("💡 按 Ctrl+C 停止监控")
+
+        cycle_count = 0
+
+        while self.running:
+            cycle_count += 1
+            print(f"\n{'=' * 50}")
+            print(f"📈 监控周期 #{cycle_count}")
+            print(f"{'=' * 50}")
+
+            try:
+                self.monitor_single_cycle()
+            except Exception as e:
+                print(f"❌ 监控周期执行出错: {e}")
+                # 继续运行，不退出
+
+            if not self.running:
+                break
+
+            # 等待下一个监控周期
+            print(f"\n⏳ 等待 {self.monitor_interval} 秒后继续监控...")
+            for i in range(self.monitor_interval):
+                if not self.running:
+                    break
+                time.sleep(1)
+                if i % 30 == 0 and i > 0:  # 每30秒打印一次等待状态
+                    remaining = self.monitor_interval - i
+                    print(f"  等待中... {remaining} 秒后继续")
+
+        print("\n🛑 监控已停止")
+
+
+def main():
+    try:
+        monitor = TwitterAPIIOMonitor()
+        monitor.start_real_time_monitoring()
+    except KeyboardInterrupt:
+        print("\n👋 用户主动停止监控")
+    except Exception as e:
+        print(f"💥 程序运行出错: {e}")
+    finally:
+        print("🎯 监控程序已退出")
+
+
+if __name__ == "__main__":
+    main()
+
+database.py：
+
+import os
+import json
+import mysql.connector
+from mysql.connector import Error
+from dotenv import load_dotenv
+
+
+class TweetDatabase:
+    def __init__(self):
+        load_dotenv()
+
+        self.host = os.getenv("MYSQL_HOST")
+        self.user = os.getenv("MYSQL_USER")
+        self.password = os.getenv("MYSQL_PASSWORD")
+        self.database = os.getenv("MYSQL_DB")
+
+        self.conn = None
+        self.connect()
+        self.create_table()
+
+    def connect(self):
+        try:
+            self.conn = mysql.connector.connect(
+                host=self.host,
+                user=self.user,
+                password=self.password,
+                database=self.database
+            )
+            print("数据库连接成功")
+        except Error as e:
+            print(f"数据库连接失败: {e}")
+            raise e
+
+    def create_table(self):
+        create_table_sql = """
+        CREATE TABLE IF NOT EXISTS tweets (
+            tweet_id VARCHAR(30) PRIMARY KEY,
+            username VARCHAR(255),
+            text TEXT,
+            source VARCHAR(255),
+            retweetCount INT DEFAULT 0,
+            replyCount INT DEFAULT 0,
+            likeCount INT DEFAULT 0,
+            quoteCount INT DEFAULT 0,
+            viewCount INT DEFAULT 0,
+            createdAt VARCHAR(255),
+            lang VARCHAR(20),
+            bookmarkCount INT DEFAULT 0,
+            isReply BOOLEAN,
+            inReplyToId VARCHAR(30),
+            conversationId VARCHAR(30),
+            displayTextRange TEXT,
+            inReplyToUserId VARCHAR(30),
+            inReplyToUsername VARCHAR(255),
+            author JSON,
+            raw_tweet JSON
+        );
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(create_table_sql)
+        cursor.close()
+        self.conn.commit()
+
+    def tweet_exists(self, tweet_id):
+        """判断该推文是否已存在"""
+        sql = "SELECT tweet_id FROM tweets WHERE tweet_id = %s LIMIT 1"
+        cursor = self.conn.cursor()
+        cursor.execute(sql, (tweet_id,))
+        result = cursor.fetchone()
+        cursor.close()
+        return result is not None
+
+    def insert_tweet(self, tweet: dict):
+        """插入新推文"""
+        sql = """
+        INSERT INTO tweets (
+            tweet_id, username, text, source,
+            retweetCount, replyCount, likeCount, quoteCount, viewCount,
+            createdAt, lang, bookmarkCount, isReply,
+            inReplyToId, conversationId, displayTextRange,
+            inReplyToUserId, inReplyToUsername, author, raw_tweet
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+
+        values = (
+            tweet["tweet_id"],
+            tweet["username"],
+            tweet["text"],
+            tweet["source"],
+            tweet.get("retweetCount", 0),
+            tweet.get("replyCount", 0),
+            tweet.get("likeCount", 0),
+            tweet.get("quoteCount", 0),
+            tweet.get("viewCount", 0),
+            tweet.get("createdAt"),
+            tweet.get("lang"),
+            tweet.get("bookmarkCount", 0),
+            tweet.get("isReply", False),
+            tweet.get("inReplyToId"),
+            tweet.get("conversationId"),
+            json.dumps(tweet.get("displayTextRange"), ensure_ascii=False),
+            tweet.get("inReplyToUserId"),
+            tweet.get("inReplyToUsername"),
+            json.dumps(tweet.get("author"), ensure_ascii=False),
+            json.dumps(tweet.get("raw_tweet"), ensure_ascii=False)
+        )
+
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(sql, values)
+            self.conn.commit()
+            print(f"数据库插入成功: tweet_id={tweet['tweet_id']}")
+        except Error as e:
+            print(f"插入失败: {e}")
+        finally:
+            cursor.close()
+
+
+dingtalk.py：
+
+import os
+import requests
+import json
+import time
+import hmac
+import hashlib
+import base64
+from urllib.parse import quote_plus
+from dotenv import load_dotenv
+
+
+class DingTalkBot:
+    def __init__(self):
+        # 加载环境变量
+        load_dotenv()
+
+        # 从环境变量获取钉钉机器人配置
+        self.access_token = os.getenv('DINGTALK_ACCESS_TOKEN')
+        self.secret = os.getenv('DINGTALK_SECRET',
+                                'SEC1e2b648e1af505a61e4b6f0e357b2be254906db38dfe28d712d2f8d172d9f161')
+
+        if not self.access_token:
+            raise ValueError("请在.env文件中配置DINGTALK_ACCESS_TOKEN")
+
+    def generate_signature(self):
+        """生成钉钉机器人签名"""
+        timestamp = str(round(time.time() * 1000))
+        string_to_sign = f'{timestamp}\n{self.secret}'
+
+        # 使用HMAC-SHA256算法计算签名
+        hmac_code = hmac.new(
+            self.secret.encode('utf-8'),
+            string_to_sign.encode('utf-8'),
+            hashlib.sha256
+        ).digest()
+
+        # Base64编码并进行URL编码
+        sign = quote_plus(base64.b64encode(hmac_code))
+        return timestamp, sign
+
+    def get_webhook_url(self):
+        """获取带签名的完整Webhook URL"""
+        timestamp, sign = self.generate_signature()
+        webhook_url = f'https://oapi.dingtalk.com/robot/send?access_token={self.access_token}&timestamp={timestamp}&sign={sign}'
+        return webhook_url
+
+    def send_markdown_message(self, title, text, at_mobiles=None, is_at_all=False):
+        """
+        发送Markdown格式消息到钉钉群
+        """
+        headers = {
+            'Content-Type': 'application/json'
+        }
+
+        # 获取带签名的Webhook URL
+        webhook_url = self.get_webhook_url()
+
+        # 构建消息数据
+        data = {
+            "msgtype": "markdown",
+            "markdown": {
+                "title": title,
+                "text": text
+            },
+            "at": {
+                "atMobiles": at_mobiles or [],
+                "isAtAll": is_at_all
+            }
+        }
+
+        try:
+            response = requests.post(
+                webhook_url,
+                headers=headers,
+                data=json.dumps(data),
+                timeout=10
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('errcode') == 0:
+                    return True
+                else:
+                    print(f"❌ 钉钉消息发送失败: {result.get('errmsg')}")
+                    return False
+            else:
+                print(f"❌ 钉钉API请求失败: {response.status_code}")
+                return False
+
+        except Exception as e:
+            print(f"❌ 钉钉消息发送异常: {e}")
+            return False
+
+    def format_tweet_message(self, tweet_data):
+        """
+        格式化推文数据为钉钉消息
+        """
+        username = tweet_data.get('username', '')
+        created_at = tweet_data.get('created_at', '')
+        text = tweet_data.get('text', '')
+        likes = tweet_data.get('likes', 0)
+        retweets = tweet_data.get('retweets', 0)
+        replies = tweet_data.get('replies', 0)
+        views = tweet_data.get('views', 0)
+        ai_summary = tweet_data.get('ai_summary', '')
+
+        # 构建标题
+        title = f"🔥 新推文提醒 - @{username}"
+
+        # 构建Markdown内容
+        text_content = f"""## 🔥 捕获到新推文！
+
+**👤 用户:** @{username}
+**🕐 时间:** {created_at}
+
+**📝 内容:**
+{text}
+
+**📊 互动数据:**
+- 👍 点赞: {likes}
+- 🔄 转推: {retweets}
+- 💬 回复: {replies}
+- 👁️ 浏览: {views}
+
+**🤖 AI摘要:**
+{ai_summary}
+
+---
+*来自 Twitter 实时监控机器人*"""
+
+        return title, text_content
+
+    def send_tweet_notification(self, tweet_data):
+        """
+        发送推文通知到钉钉
+        """
+        title, content = self.format_tweet_message(tweet_data)
+        return self.send_markdown_message(title, content)
+
+
+# 单例模式，便于全局使用
+dingtalk_bot = DingTalkBot()
+
+
+.env文件：
+
+MYSQL_HOST=localhost
+MYSQL_USER=root
+MYSQL_PASSWORD="Wlk8916!$#"
+MYSQL_DB=推特监控_手搓版
+
+TWITTER_API_KEY=747cf17386ab4fcd8a8f4591e6109f43
+DASHSCOPE_API_KEY=sk-0501148d869d404db92a60b29b6aa11c
+DINGTALK_ACCESS_TOKEN=194fec64adf35c6d55de2454dfaa8be2501a6578abe30a4f005dd4b16048ac14
+
+TARGET_USERS=whyyoutouzhele,wangzhian8848,tankman2002,xiaojingcanxue
+MONITOR_INTERVAL=300
+MAX_TWEETS_PER_REQUEST=5

@@ -1,0 +1,27 @@
+CREATE TABLE `tweets` (
+	`tweet_id` VARCHAR(30) NOT NULL COLLATE 'utf8mb4_0900_ai_ci',
+	`username` VARCHAR(255) NULL DEFAULT NULL COLLATE 'utf8mb4_0900_ai_ci',
+	`text` TEXT NULL DEFAULT NULL COLLATE 'utf8mb4_0900_ai_ci',
+	`source` VARCHAR(255) NULL DEFAULT NULL COLLATE 'utf8mb4_0900_ai_ci',
+	`retweetCount` INT NULL DEFAULT NULL,
+	`replyCount` INT NULL DEFAULT NULL,
+	`likeCount` INT NULL DEFAULT NULL,
+	`quoteCount` INT NULL DEFAULT NULL,
+	`viewCount` INT NULL DEFAULT NULL,
+	`createdAt` VARCHAR(255) NULL DEFAULT NULL COLLATE 'utf8mb4_0900_ai_ci',
+	`lang` VARCHAR(20) NULL DEFAULT NULL COLLATE 'utf8mb4_0900_ai_ci',
+	`bookmarkCount` INT NULL DEFAULT NULL,
+	`isReply` TINYINT(1) NULL DEFAULT NULL,
+	`inReplyToId` VARCHAR(30) NULL DEFAULT NULL COLLATE 'utf8mb4_0900_ai_ci',
+	`conversationId` VARCHAR(30) NULL DEFAULT NULL COLLATE 'utf8mb4_0900_ai_ci',
+	`displayTextRange` TEXT NULL DEFAULT NULL COLLATE 'utf8mb4_0900_ai_ci',
+	`inReplyToUserId` VARCHAR(30) NULL DEFAULT NULL COLLATE 'utf8mb4_0900_ai_ci',
+	`inReplyToUsername` VARCHAR(255) NULL DEFAULT NULL COLLATE 'utf8mb4_0900_ai_ci',
+	`author` JSON NULL DEFAULT NULL,
+	`raw_tweet` JSON NULL DEFAULT NULL,
+	`ai_summary` TEXT NULL DEFAULT NULL COLLATE 'utf8mb4_0900_ai_ci',
+	PRIMARY KEY (`tweet_id`) USING BTREE
+)
+COLLATE='utf8mb4_0900_ai_ci'
+ENGINE=InnoDB
+;
